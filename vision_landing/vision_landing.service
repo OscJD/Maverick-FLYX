@@ -1,0 +1,9 @@
+[Unit]
+Description=Vision Landing System
+
+[Service]
+ExecStart=/usr/local/vision_landing/vision_landing
+TimeoutStartSec=0
+
+[Install]
+WantedBy=multi-user.target

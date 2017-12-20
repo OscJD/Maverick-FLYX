@@ -1,0 +1,675 @@
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+
+# vision_landing
+# https://github.com/fnoop/vision_landing
+#
+# This python script connects to arducopter using dronekit, to control precision landing.
+# The control is purely visual using pose estimation from fiducial markers (eg. aruco or april tags), no additional rangefinder is needed.
+# It launches a separate program track_targets which does the actual cv work and captures the resulting vectors from non-blocking thread handler.
+
+from threading import Thread, Event
+from Queue import Queue, Empty
+from subprocess import Popen, PIPE
+from dronekit import connect, VehicleMode, LocationGlobal, LocationGlobalRelative
+from pymavlink import mavutil
+from time import sleep, time
+from datetime import datetime, timedelta
+from sys import exit, stdout, stderr
+from os import path, makedirs, symlink, remove
+from math import pi
+from re import sub, search
+from collections import deque
+from math import sqrt
+import signal
+import logging
+
+### ================================
+### Define Classes
+### ================================
+
+# Threaded Reader class connects the output from the track_targets process to a non-blocking reader, and adds any messages to a queue.
+# The queue is then read by the main loop and if anything is waiting it calls a method to process from the track_targets object.
+class ThreadedReader:
+    def __init__(self, stdout, stderr):
+        self.stdout = stdout
+        self.stderr = stderr
+        self.queue = Queue()
+        self._stop = Event()
+        def insertQueue(pipe, queue, qtype="stdout"):
+            while not self.stopped():
+                line = pipe.readline().rstrip()
+                if line and qtype == "stdout":
+                    queue.put(line)
+                elif line and qtype == "stderr":
+                    queue.put("error:"+line)
+        self.threadout = Thread(target = insertQueue, args = (self.stdout, self.queue))
+        self.threadout.daemon = True
+        self.threadout.start()
+        self.threaderr = Thread(target = insertQueue, args = (self.stderr, self.queue, "stderr"))
+        self.threaderr.daemon = True
+        self.threaderr.start()
+    def readline(self, timeout = None):
+        try:
+            return self.queue.get(block = timeout is not None, timeout = timeout)
+        except Empty:
+            return None
+    def clear(self):
+        with self.queue.mutex:
+            self.queue.queue.clear()
+    def stop(self):
+        self._stop.set()
+    def stopped(self):
+        return self._stop.isSet()
+
+# TrackTime class is used to synchronise time between the companion computer and the flight controller.
+# This is necessary to ensure that the vision frames are matched as closely as possible with the inertial frames.
+# Note: This requires a Craft object to be passed, in order to perform the actual sync. 
+class TrackTime:
+    def __init__(self, craft):
+        self.fctime_nanos = 0
+        self.mytime_nanos = 0
+        self.send_tracker = {}
+        self.local_tracker = {}
+        self.delta = None
+        self.delta_buffer = deque(maxlen=50) # Circular buffer to track timesync deltas
+        self.debug = False
+        self.vehicle = craft.vehicle
+        # Setup listener decorator
+        @self.vehicle.on_message("TIMESYNC")
+        def listener_timesync(subself, name, message):
+            try:
+                if message.ts1 < self.mytime_nanos:
+                    log.info("Newer timesync message already received, ignoring")
+                    print("Newer timesync message already received, ignoring")
+                    return False
+                self.send_tracker[message.ts1] = message.tc1
+                self.mytime_nanos = message.ts1 # Set the time that the message was sent
+                _cts = self.current_timestamp()
+                _avg_ts = (self.local_tracker[message.ts1] + _cts)/2;
+                self._delta = _cts - _avg_ts # Calculuate the time delta
+                self.delta_buffer.append(self._delta) # Push the delta into the circular buffer
+                # If the averaged delta has been reached, use that, and update the delta from the latest buffer
+                # TODO: This still applies the averaged delta to the spot tc1 which is subject to jitter
+                if self.delta:
+                    self.delta = sum(list(self.delta_buffer)) / len(list(self.delta_buffer))
+                    self.fctime_nanos = message.tc1 - self.delta
+                # Otherwise use the spot delta from the incoming message
+                else:
+                    self.fctime_nanos = message.tc1 - self._delta
+                if self.debug:
+                    log.debug("Timesync message received:"+", ".join([str(message), str(self._delta), str(self.fctime_nanos)]))
+                    print("Timesync message received:"+", ".join([str(message), str(self._delta), str(self.fctime_nanos)]))
+            except:
+                if self.debug:
+                    log.debug("Error, unexpected timesync timestamp received:"+str(message.ts1))
+                    print("Error, unexpected timesync timestamp received:"+str(message.ts1))
+    # Blocking method to call once during startup, to calculate delta
+    def initial_sync(self):
+        print "Keep sending timesync requests until the delta buffer is full"
+        cont=0
+        while len(list(self.delta_buffer)) < 50:
+            cont=cont+1
+            self.update()
+            sleep(0.1) # Ardupilot can't cope with too many timesync messages being sent in a short time period, the results are nonsense
+            print len(list(self.delta_buffer))
+        print "Finish"
+        # When full, average the delta buffer and then set that to use as the ongoing delta
+        self.delta = sum(list(self.delta_buffer)) / len(list(self.delta_buffer))
+    # Method to return local UCT time in nanoseconds since epoch.  Precision depends on platform.
+    def current_timestamp(self):
+        return int((datetime.utcnow() - datetime(1970, 1, 1)).total_seconds() * 1000000000);
+    # Request a timesync update from the flight controller
+    def update(self, ts=0, tc=0):
+        if ts == 0:
+            ts = self.current_timestamp()
+        self.local_tracker[ts] = self.current_timestamp() # Create entry to correlate sending timestamp with actual localtime
+        self.send_tracker[ts] = None # Create an entry to track this timestamp
+        msg = self.vehicle.message_factory.timesync_encode(tc1=tc,ts1=ts)
+        self.vehicle.send_mavlink(msg)
+        self.vehicle.flush()
+    # Note: This returns the 'actual' time of the FC with the delay compensated from the last sync event
+    def actual(self):
+        return self.fctime_nanos
+    def difference(self):
+        return self.delta
+    # Return actual + time elapsed since actual set
+    def estimate(self):
+        log.debug("Estimating time, fctime_nanos:"+str(self.fctime_nanos/1000)+", time since:"+str((self.current_timestamp() - self.mytime_nanos)/1000))
+        print("Estimating time, fctime_nanos:"+str(self.fctime_nanos/1000)+", time since:"+str((self.current_timestamp() - self.mytime_nanos)/1000))
+        return self.fctime_nanos + (self.current_timestamp() - self.mytime_nanos)
+
+# TrackTargets class launches, controls and handles the separate track_targets process that does the actual vision processing.
+class TrackTargets:
+    def __init__(self, args, calibration):
+        self.state = None
+        self.shutdown = False
+        # Setup timing containers
+        self.frame_times = []
+        self.start_t = time()
+        # Work out starting parameters
+        self.setup(args, calibration)
+        # Launch tracking process and process output
+        log.info("Launching track_targets with arguments:" + " ".join(self.track_arguments))
+        print("Launching track_targets with arguments:" + " ".join(self.track_arguments))
+        self.launch()
+    def setup(self, args, calibration):
+        # Define the basic arguments to track_targets
+        self.track_arguments = [cwd+'/track_targets']
+        # If marker dictionary is set, pass it through
+        if args.markerdict:
+            self.track_arguments.extend(['-d', args.markerdict])
+        # If output is set, pass it through
+        if args.output:
+            now = datetime.now()
+            nowtime = now.strftime("%Y-%m-%d-%H-%M-%S")
+            args_output = sub("-xxx", "-"+str(nowtime), args.output)
+            self.track_arguments.extend(['-o', args_output])
+        # If marker id is set, pass it through
+        if args.markerid:
+            self.track_arguments.extend(['-i', args.markerid])
+        # If width is set, pass it through
+        if args.width:
+            self.track_arguments.extend(['-w', str(args.width)])
+        # If height is set, pass it through
+        if args.height:
+            self.track_arguments.extend(['-g', str(args.height)])
+        # If fps is set, pass it through
+        if args.fps:
+            self.track_arguments.extend(['-f', str(args.fps)])
+        # If verbose is set, pass it through
+        if args.verbose:
+            self.track_arguments.extend(['-v'])
+        # If brightness is set, pass it through
+        if args.brightness:
+            self.track_arguments.extend(['-b', args.brightness])
+        # If fourcc codec is set, pass it through
+        if args.fourcc:
+            self.track_arguments.extend(['-c', args.fourcc])
+        # If sizemapping is set, pass it through
+        if args.sizemapping:
+            self.track_arguments.extend(['-z', args.sizemapping])
+        # If markerhistory is set, pass it through
+        if args.markerhistory:
+            self.track_arguments.extend(['--markerhistory', str(args.markerhistory)])
+        # If markerthreshold is set, pass it through
+        if args.markerthreshold:
+            self.track_arguments.extend(['--markerthreshold', str(args.markerthreshold)])
+        # Add positional arguments
+        self.track_arguments.extend([args.input, calibration, str(args.markersize)])
+    def launch(self):
+        self.process = Popen(self.track_arguments, stdin = PIPE, stdout = PIPE, stderr = PIPE, shell = False, bufsize=1)
+        self.reader = ThreadedReader(self.process.stdout, self.process.stderr)
+        self.state = "initialising"
+    def processline(self, line):
+        # Unpack data from track_targets data
+        trackdata = line.rstrip().split(":")
+        # If not target data, log and skip to next data
+        if trackdata[0] != "target":
+            datatype = trackdata[0]
+            if trackdata[0] == "error":
+                log.error("track_targets: " +str(trackdata[1:]))
+                print("track_targets: " +str(trackdata[1:]))
+            elif trackdata[0] == "debug" and args.verbose:
+                log.debug("track_targets: " + datatype[0].upper() + datatype[1:] + str(trackdata[1:]))
+                print("track_targets: " + datatype[0].upper() + datatype[1:] + str(trackdata[1:]))
+            elif trackdata[0] == "info":
+                log.info("track_targets: " + str(trackdata[1:]))
+                print("track_targets: " + str(trackdata[1:]))
+                if trackdata[1] == "initcomp":
+                    self.state = "initialised"
+            return
+        # Unpack and cast target data to correct types
+        [id,x,y,z] = trackdata[1:]
+        [id,x,y,z] = [int(id),float(x),float(y),float(z)]
+        # If fake rangefinder distance is required, send it
+        if args.fakerangefinder:
+            craft.send_distance_message(int(z*100))
+        # Send the landing_target message to arducopter
+        # NOTE: This sends the current estimated fctime, NOT the time the frame was actually captured.
+        # So this does not allow for the CV processing time. This should be sending when the frame is actually captured, before processing.
+        craft.send_land_message(x,y,z, tracktime.estimate()/1000) # Send in micros, not nanos
+        # Track frame timing to calculate fps, running average over last 5 frames
+        end_t = time()
+        time_taken = end_t - self.start_t
+        self.start_t = end_t
+        self.frame_times.append(time_taken)
+        self.frame_times = self.frame_times[-5:]
+        fps = len(self.frame_times) / sum(self.frame_times)
+        # log.info("Fctime:"+str(tracktime.estimate())+", Fps: "+str(fps)+", Alt:"+ str(craft.vehicle.location.global_relative_frame.alt)+", Rangefinder:"+ str(craft.vehicle.rangefinder.distance)+ ", Marker:"+ str(id)+ ", Distance:"+str(z)+ "xOffset:"+str(x)+ "yOffset:"+str(y))
+        log.info("Fctime:"+str(tracktime.actual())+", Fps: "+str(fps)+", Alt:"+ str(craft.vehicle.location.global_relative_frame.alt)+", Rangefinder:"+ str(craft.vehicle.rangefinder.distance)+ ", Marker:"+ str(id)+ ", Distance:"+str(z)+ "xOffset:"+str(x)+ "yOffset:"+str(y))
+    def start(self):
+        if self.state == "initialised":
+            log.info("Requesting track_targets to start tracking:"+str(craft.vehicle.mode))
+            self.process.send_signal(signal.SIGUSR1)
+            self.state = "started"
+        else:
+            log.info("Request to start track_targets tracking failed, state is not 'initialised'")
+        # self.state = "started"
+        # self.process.stdin.write("BLAAAAAAH!\n") # This doesn't work yet
+    def stop(self):
+        log.info("Requesting track_targets to stop tracking:"+str(craft.vehicle.mode))
+        self.state = "initialised"
+        self.process.send_signal(signal.SIGUSR2)
+    def end(self):
+        log.info("Shutting down track_targets")
+        # Stop threaded reader
+        self.reader.stop()
+        # track_targets should always be stopped by now, but be sure
+        self.process.poll()
+        if self.process.returncode == None:
+            self.process.terminate()
+        self.shutdown = True
+
+# The Craft class connects to the flight controller and sends controlling messages
+class Craft:
+    def __init__(self, connectstr):
+        self.debug = False
+        self.mode = None
+        self.connected = None
+        self.vehicle = None
+        self.connect(connectstr)
+        self.precloiter_opt = self.find_precloiter_opt()
+        if self.precloiter_opt:
+            log.info("Precision loiter switch found: Channel "+str(self.precloiter_opt))
+    def connect(self, connectstr):
+        try:
+            # self.vehicle = connect(connectstr, wait_ready=True, rate=1)
+            # self.vehicle = connect(connectstr, wait_ready=True)
+            # self.vehicle = connect(connectstr, wait_ready=['system_status','mode'], baud=921600)
+            self.vehicle = connect("/dev/ttyS0", wait_ready=True,baud=57600)
+            self.connected = True
+        except Exception,e:
+            log.critical("Error connecting to vehicle:"+str(repr(e)))
+            print("Error connecting to vehicle:"+str(repr(e)))
+            self.connected = False
+    # Define function to send distance_message mavlink message for mavlink based rangefinder, must be >10hz
+    # http://mavlink.org/messages/common#DISTANCE_SENSOR
+    def send_distance_message(self, dist):
+        msg = self.vehicle.message_factory.distance_sensor_encode(
+            0,          # time since system boot, not used
+            1,          # min distance cm
+            10000,      # max distance cm
+            dist,       # current distance, must be int
+            0,          # type = laser?
+            0,          # onboard id, not used
+            mavutil.mavlink.MAV_SENSOR_ROTATION_PITCH_270, # must be set to MAV_SENSOR_ROTATION_PITCH_270 for mavlink rangefinder, represents downward facing
+            0           # covariance, not used
+        )
+        self.vehicle.send_mavlink(msg)
+        self.vehicle.flush()
+        if args.verbose:
+            log.debug("Sending mavlink distance_message:" +str(dist))
+    # Define function to send landing_target mavlink message for mavlink based precision landing
+    # http://mavlink.org/messages/common#LANDING_TARGET
+    def send_land_message(self, x,y,z, time_usec=0):
+        msg = self.vehicle.message_factory.landing_target_encode(
+            time_usec,          # time since system boot, not used
+            0,          # target num, not used
+            mavutil.mavlink.MAV_FRAME_BODY_NED, # frame, not used
+            x,          # X-axis angular offset, in radians
+            y,          # Y-axis angular offset, in radians
+            z,          # distance, in meters
+            0,          # Target x-axis size, in radians
+            0           # Target y-axis size, in radians
+        )
+        self.vehicle.send_mavlink(msg)
+        self.vehicle.flush()
+        if args.verbose:
+            log.debug("Sending mavlink landing_target:"+str(x)+" "+str(y)+" "+str(z))
+    # Define function that arms and takes off, used for testing in SITL
+    # Lifted from dronekit-python examples
+    def arm_and_takeoff(self, targetAltitude):
+        log.info("Basic pre-arm checks")
+        # Don't let the user try to arm until autopilot is ready
+        while not self.vehicle.is_armable:
+            log.info(" Waiting for vehicle to initialise...")
+            sleep(1)
+        log.info("Arming motors")
+        # Copter should arm in GUIDED mode
+        self.vehicle.mode = VehicleMode("GUIDED")
+        self.vehicle.armed = True
+        while not self.vehicle.armed:      
+            log.info(" Waiting for arming...")
+            sleep(1)
+        log.info("Taking off!")
+        self.vehicle.simple_takeoff(targetAltitude) # Take off to target altitude
+        # Wait until the vehicle reaches a safe height before processing the goto (otherwise the command 
+        #  after Vehicle.simple_takeoff will execute immediately).
+        while True:
+            log.info(" Altitude: " + str(self.vehicle.location.global_relative_frame.alt))
+            if self.vehicle.location.global_relative_frame.alt>=targetAltitude*0.95: #Trigger just below target alt.
+                log.info("Reached target altitude")
+                break
+            sleep(1)
+    # Scan through option channels for one set to 39 (precision loiter)
+    def find_precloiter_opt(self):
+        _optch = None
+        for ch in range(7,16):
+            try:
+                if self.vehicle.parameters['CH'+str(ch)+'_OPT'] == 39:
+                    _optch = ch
+            except:
+                pass
+        return _optch
+
+# Class for signal tracking and handling.  This is used to accept Ctrl-C or SIGHUP/SIGKILL type events.
+class SigTrack:
+    def __init__(self):
+        self.counter = 0
+    def add(self):
+        self.counter += 1
+    def count(self):
+        return self.counter
+    def handle_sig(self, signal, frame):
+        log.info("Signal handler called, calling shutdown and cleanup logic")
+        track_targets.end()
+        sigtracker.add()
+        log.debug("Sigtracker count:"+str(sigtracker.count()))
+        if sigtracker.count() >= 3:
+            log.warning("Signal handler called three times, exiting immediately")
+            exit(1)
+
+### ================================
+### End Define Classes
+### ================================
+
+### ================================
+### Define Functions
+### ================================
+
+# Return correctly typed config parser option
+def get_config_value(parser, section, option):
+    """Parses config value as python type"""
+    try:
+        return parser.getint(section, option)
+    except ValueError:
+        pass
+    try:
+        return parser.getfloat(section, option)
+    except ValueError:
+        pass
+    try:
+        return parser.getboolean(section, option)
+    except ValueError:
+        pass
+    return parser.get(section, option)
+
+### ================================
+### End Define Functions
+### ================================
+
+### --------------------------------
+### Parse arguments, setup logging
+### --------------------------------
+
+# Find full directory path of this script, used for loading config and other files
+cwd = path.dirname(path.abspath(__file__))
+
+# Find current time, used for dating files
+now = datetime.now()
+nowtime = now.strftime("%Y-%m-%d-%H-%M-%S")
+
+# Configure argument parsing
+import argparse
+import ConfigParser
+parser = argparse.ArgumentParser(description='Vision based precision landing')
+parser.add_argument('--config', '-c', default=cwd+"/vision_landing.conf", help="config file location, defaults to same directory as vision_landing")
+parser.add_argument('--connect', help="dronekit vehicle connection target string, eg. /dev/ttyS0, tcp:localhost:5770, udp:localhost:14560")
+parser.add_argument('--markersize', help="Target marker size, in meters, required")
+parser.add_argument('--sizemapping', '-z', help="Marker Size Mappings, in marker_id:size format, comma separated")
+parser.add_argument('--markerhistory', help="Marker tracking history, in frames, defaults to 15")
+parser.add_argument('--markerthreshold', help="Marker tracking threshold, in percentage, defaults to 50")
+parser.add_argument('--calibration', help="camera calibration data, required")
+parser.add_argument('--input', '-i', default="/dev/video0", help="camera input, defaults to /dev/video0")
+parser.add_argument('--output', '-o', help="gstreamer output pipeline, defaults to none")
+parser.add_argument('--markerdict', '-d', default="ARUCO_MIP_36h12", help="Target marker dictionary, defaults to ARUCO_MIP_36h12")
+parser.add_argument('--markerid', '-id', help="Target ID (optional, if not specified will use closest target)")
+parser.add_argument('--simulator', '-s', action='store_true', help="Perform initial simulator actions for testing, takeoff and initiate land")
+parser.add_argument('--width', '-w', help="Video Input Resolution - Width")
+parser.add_argument('--height', '-g', help="Video Input Resolution - Height")
+parser.add_argument('--fps', '-f', help="Video Output FPS - Kludge factor")
+parser.add_argument('--verbose', '-v', action='store_true', help="Verbose/Debug output")
+parser.add_argument('--brightness', '-b', help="Camera Brightness/Gain")
+parser.add_argument('--fourcc', '-u', help="Specify FourCC codec")
+parser.add_argument('--fakerangefinder', '-r', action='store_true', help="Fake RangeFinder Data")
+parser.add_argument('--logdir', '-l', help="Log directory, if not specified will log to stdout")
+parser.add_argument('--controlprocessing', '-p', action='store_true', help="Control Vision Processing - enable/disable based on arming status and landing/precloiter mode")
+args = parser.parse_args()
+# First parse config file, and set defaults
+defaults = {}
+if path.isfile(args.config):
+    config = ConfigParser.SafeConfigParser()
+    config.read([args.config])
+    for key, value in config.items("Defaults"):
+        defaults[key] = get_config_value(config, "Defaults", key)
+    parser.set_defaults(**defaults)
+    args = parser.parse_args()
+else:
+    print
+    print "Error: Config file "+str(args.config)+" does not exist"
+    print
+    exit(1)
+    
+# If we don't have the mandatory arguments, exit
+if not args.calibration or not args.markersize or not args.connect:
+    print
+    if not args.calibration:
+        print "Error: missing required argument 'calibration'"
+    if not args.markersize:
+        print "Error: missing required argument 'markersize'"
+    if not args.connect:
+        print "Error: missing required argument 'connect'"
+    print
+    parser.print_usage()
+    exit(1)
+
+# Setup logging
+console = logging.StreamHandler()
+if args.logdir:
+    # If logdir specified, create if it doesn't exist
+    if not path.exists(args.logdir):
+        makedirs(args.logdir)
+    # Add timestamped logfile out
+    logging.basicConfig(filename=args.logdir+'/vision_landing.'+nowtime+'.log', format='%(asctime)s %(levelname)s %(message)s', level=logging.DEBUG)
+    # Create handly symlink to current logfile
+    if path.exists(args.logdir+'/last.log'):
+        remove(args.logdir+'/last.log')
+    symlink(args.logdir+'/vision_landing.'+nowtime+'.log', args.logdir+'/last.log')
+else:
+    logging.basicConfig(format='%(asctime)s %(levelname)s %(message)s', level=logging.DEBUG)
+log = logging.getLogger(__name__)
+
+# Check if calibration data exists
+if path.isfile(cwd+"/calibration/"+args.calibration):
+    calibration = cwd+"/calibration/"+args.calibration
+elif path.isfile(args.calibration):
+    calibration = args.calibration
+else:
+    log.critical("Error: specified calibration does not exist.")
+    exit(1)
+
+### --------------------------------
+### Start track_targets CV process
+###  and attach threaded reader
+### --------------------------------
+
+# Check track_targets exists
+if not path.isfile(cwd+"/track_targets"):
+    log.critical("Error: track_targets does not exist.  Please run 'make install' in src/ directory")
+    exit(1)
+print "1"
+# Run the vision tracker as a thread
+try:
+    track_targets = TrackTargets(args, calibration)
+    sleep(1)
+except Exception as error:
+    log.critical("Error starting track_targets:"+ str(error))
+    print "2"
+    exit(1)
+track_targets.process.poll()
+if track_targets.process.returncode != None:
+    log.critical("Error starting track_targets")
+    print "3"
+    exit(1)
+
+# Define a function that stops and clears up cv process
+def cleanup():
+    # Do a final check to see if tracker process still running, try to shut down if so
+    track_targets.process.poll()
+    if track_targets.process.returncode == None:
+        track_targets.end()
+    # Close connection to the drone
+    try:
+        craft.vehicle.close()
+    except:
+        pass
+
+### --------------------------------
+### Start up procedure - setup signal handlers,
+###  connect to drone, start syncing time with drone,
+###  setup drone parameters
+### --------------------------------
+print "4"
+# Setup signal handlers
+sigtracker = SigTrack()
+signal.signal(signal.SIGINT, sigtracker.handle_sig)
+signal.signal(signal.SIGTERM, sigtracker.handle_sig)
+
+# Connect to the Vehicle
+log.info("Connecting to drone on: %s" % args.connect)
+print("Connecting to drone on: %s" % args.connect)
+craft = Craft(args.connect)
+if not craft.connected:
+    log.critical("Error: Could not connect to drone")
+    cleanup()
+    exit(1)
+else:
+    log.info("Connected to drone")
+    print "Connected to drone"
+
+# Create a new TrackTime object to try and keep sync with the flight controller
+log.info("Starting time synchronisation with flight controller")
+print("Starting time synchronisation with flight controller")
+tracktime = TrackTime(craft)
+print "5"
+tracktime.debug = False
+print "6"
+# Perform the initial sync with the flight controller.  This blocks until the sync is complete.
+print "initial_sync()..."
+tracktime.initial_sync()
+log.info("Initial time sync complete, offset is {} ms".format(tracktime.difference()/1000000))
+print("Initial time sync complete, offset is {} ms".format(tracktime.difference()/1000000))
+log.info("Initial timesync delta buffer: {}".format(list(tracktime.delta_buffer)))
+print("Initial timesync delta buffer: {}".format(list(tracktime.delta_buffer)))
+_daverage = sum(tracktime.delta_buffer) * 1.0 / len(tracktime.delta_buffer)
+_dvariance = map(lambda x: (x - _daverage)**2, tracktime.delta_buffer)
+_variance = sum(_dvariance) * 1.0 / len(_dvariance)
+# Calculate standard deviation of delta (latency) variance
+# A median standard deviation would probably be better here to represent jitter
+stddev = round((_variance ** 0.5 / 1000000), 2)
+jitterpercent = round((stddev / (tracktime.difference()/1000000)) * 100, 2)
+log.info("Initial timesync jitter (standard deviation of delta buffer): {} ms, {}% of average latency".format(stddev, jitterpercent))
+if jitterpercent > 20:
+    log.info("WARNING: Timesync jitter is VERY high. This will signficantly affect video frame -> inertial frame correlation.")
+
+# Set some parameters important to precision landing
+log.info("Setting flight controller parameters")
+craft.vehicle.parameters['PLND_ENABLED'] = 1 
+craft.vehicle.parameters['PLND_TYPE'] = 1 # Mavlink landing mode
+# Set estimator type to 'raw', as ekf estimator can be very erratic
+try:
+    if 'PLND_EST_TYPE' in craft.vehicle.parameters:
+        # TODO: Set a config parameter for estimator type
+        craft.vehicle.parameters['PLND_EST_TYPE'] = 0 # https://github.com/ArduPilot/ardupilot/pull/5491, not yet in arducopter
+except:
+    pass
+# Set the precland buffer to 250ms.  This should give enough buffer space for even very slow computers
+try:
+    if 'PLND_BUFFER' in craft.vehicle.parameters:
+        craft.vehicle.parameters['PLND_BUFFER'] = 250
+except:
+    pass
+
+if args.fakerangefinder:
+    # Following are for mavlink based rangefinder (not needed for 3.5-rc2+)
+    craft.vehicle.parameters['RNGFND_TYPE'] = 10
+    craft.vehicle.parameters['RNGFND_MIN_CM'] = 1
+    craft.vehicle.parameters['RNGFND_MAX_CM'] = 10000
+    craft.vehicle.parameters['RNGFND_GNDCLEAR'] = 5
+    log.info("Faking RangeFinder data with distance_sensor messages")
+
+# If simulator option set, perform initial takeoff and initiate land
+if args.simulator:
+    if args.fakerangefinder:
+        # Following are for SITL rangefinder
+        craft.vehicle.parameters['RNGFND_TYPE'] = 1 
+        craft.vehicle.parameters['RNGFND_MIN_CM'] = 0
+        craft.vehicle.parameters['RNGFND_MAX_CM'] = 4000
+        craft.vehicle.parameters['RNGFND_PIN'] = 0
+        craft.vehicle.parameters['RNGFND_SCALING'] = 12.12
+    # Take off to 25m altitude and start landing if not already armed
+    if not craft.vehicle.armed:
+        craft.arm_and_takeoff(25)
+        # Start landing
+        log.info("Starting landing...")
+        craft.vehicle.mode = VehicleMode("LAND")
+
+# Clear the vision tracking queue, we don't want to blast mavlink messages for everything stacked up
+while True:
+    line = track_targets.reader.readline()
+    if not line:
+        break
+    elif not search("^target:", line):
+        if search("^error:", line):
+            log.error("track_targets: "+sub("^error:","",line))
+        # Make sure to catch and process initcomp if it's in this initial queue
+        elif search("initcomp", line):
+            track_targets.processline(line)
+        else:
+            log.info("track_targets: "+line)
+
+### --------------------------------
+### Main Loop
+### Monitor for landing/precloiter mode
+### Listen for incoming cv tracking results
+### --------------------------------
+log.info("Entering main tracking loop")
+loop_counter = 0
+while True:
+    # Update timesync
+    tracktime.update()
+
+    # If craft mode has changed, take action
+    if (args.controlprocessing and (craft.vehicle.armed and (craft.vehicle.mode == "LAND" or (craft.vehicle.mode == "LOITER" and (craft.precloiter_opt and craft.vehicle.channels[str(craft.precloiter_opt)] > 1800))))) and track_targets.state == "initialised":
+        track_targets.start()
+    elif (args.controlprocessing and (not craft.vehicle.armed or (craft.vehicle.mode != "LAND" and (craft.vehicle.mode != "LOITER" and (craft.precloiter_opt and craft.vehicle.channels[str(craft.precloiter_opt)] <= 1800))))) and track_targets.state == "started":
+        track_targets.stop()
+    elif not args.controlprocessing and track_targets.state == "initialised":
+        track_targets.start()
+
+    # See if there are any tracking results in the queue
+    line = track_targets.reader.readline()
+    if line:
+        track_targets.processline(line)
+    else:
+        # Add a short 1s sleep to slow down the loop, otherwise it consumes 100% cpu.
+        sleep(1)
+
+    if args.simulator and not craft.vehicle.armed and not track_targets.shutdown:
+        log.info("Landed")
+        track_targets.end()
+
+    track_targets.process.poll() # Poll the track_targets process and populate returncode, exit main loop when track_targets shut down
+    if track_targets.process.returncode != None and track_targets.shutdown:
+        log.info("Tracking process return code:"+str(track_targets.process.returncode)+", exiting main loop")
+        break
+    elif track_targets.process.returncode != None and not track_targets.shutdown and track_targets.state == "started":
+        log.error("Error: Tracking process shut down unexpectedly ("+str(track_targets.process.returncode)+"), restarting")
+        track_targets = TrackTargets(args, calibration)
+
+    loop_counter += 1
+    
+cleanup()
+log.info("Vision_landing shutdown complete, exiting")
+exit(track_targets.process.returncode)
